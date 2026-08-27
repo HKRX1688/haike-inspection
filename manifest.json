@@ -1,12 +1,13 @@
 {
-  "name": "海科废纸随机抽检系统",           // 完整应用名（安装时显示）
-  "short_name": "海科抽检",                 // 桌面图标下方短名称
+  "name": "海科废纸随机抽检系统",
+  "short_name": "海科抽检",
   "description": "双点位随机抽检，拍照留证，品级记录，防偷换系统",
-  "start_url": ".",                         // 应用启动入口（当前目录）
-  "display": "standalone",                  // 全屏独立运行（无浏览器地址栏）
-  "orientation": "portrait",                // 强制竖屏
-  "background_color": "#0d2535",            // 启动画面背景色
-  "theme_color": "#0d2535",                 // 状态栏颜色
+  "start_url": ".",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0d2535",
+  "theme_color": "#0d2535",
   "lang": "zh-CN",
   "icons": [
     {
@@ -18,7 +19,7 @@
       "src": "icon-512.png",
       "sizes": "512x512",
       "type": "image/png",
-      "purpose": "any maskable"              // 支持自适应图标形状
+      "purpose": "any maskable"
     }
   ]
 }
