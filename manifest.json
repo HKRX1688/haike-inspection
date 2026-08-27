@@ -8,5 +8,6 @@
   "scope": "/",
   "short_name": "haike-inspection",
   "start_url": "/",
-  "theme_color": "#ffffff"
+  "theme_color": "#ffffff",
+  "lang": "zh"
 }
