@@ -10,8 +10,7 @@
     <title>海科废纸随机抽检系统 V1.0</title>
     <!-- PWA 清单文件 -->
     <link rel="manifest" href="./manifest.json">
-    <!-- html2canvas 用于长图导出（如需完全离线可下载至本地并改成本地路径） -->
-    <script src="https://html2canvas.hertzen.com/dist/html2canvas.min.js"></script>
+    <!-- html2canvas 改为非阻塞动态懒加载（见底部 initHtml2canvas），避免 CDN 阻塞导致首屏/PWA 启动卡住 -->
     <style>
         :root {
             --bg: #f0f2f5; --card: #fff; --primary: #0d2535; --accent: #e67e22; --danger: #c0392b; --success: #27ae60;
@@ -51,6 +50,9 @@
         .info-block { background:#fafbfc; padding:12px; border-radius:8px; font-size:0.85rem; line-height:1.7; }
         .toast { position:fixed; top:16px; left:50%; transform:translateX(-50%); background:#2c3e50; color:#fff; padding:10px 20px; border-radius:20px; z-index:300; }
         .hidden { display:none !important; }
+        /* 启动加载提示（避免 PWA 启动画面后黑屏/无反馈） */
+        #bootStatus { text-align:center; padding:18px; color:var(--text-secondary); font-size:0.85rem; }
+        #bootStatus .dot { display:inline-block; width:8px; height:8px; margin:0 2px; border-radius:50%; background:var(--accent); animation:pulse 1s infinite; }
     </style>
 </head>
 <body>
@@ -60,13 +62,14 @@
     </header>
 
     <div class="container" id="appContainer">
-        <div class="step-indicator" id="stepIndicator">
+        <div id="bootStatus"><span class="dot"></span><span class="dot"></span><span class="dot"></span> 正在初始化…</div>
+        <div class="step-indicator hidden" id="stepIndicator">
             <div class="step-dot active" id="dot1"></div> <div class="step-dot" id="dot2"></div> <div class="step-dot" id="dot3"></div>
             <div class="step-dot" id="dot4"></div> <div class="step-dot" id="dot5"></div> <div class="step-dot" id="dot6"></div>
         </div>
 
         <!-- 步骤1：车辆信息+三张进场照 -->
-        <div class="card" id="step1Card">
+        <div class="card hidden" id="step1Card">
             <div class="card-header">🚛 第1步：车辆信息 & 进场拍照（3张）</div>
             <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
                 <div class="form-group"><label class="form-label">车牌号 *</label><input class="form-input" id="plateInput" placeholder="粤A12345"></div>
@@ -187,25 +190,44 @@
     <div class="toast" id="toast" style="display:none;"></div>
 
     <script>
+        // ==================== 启动完成：隐藏加载提示，显示主界面 ====================
+        function bootReady() {
+            var bs = document.getElementById('bootStatus');
+            if (bs) bs.style.display = 'none';
+            document.getElementById('stepIndicator').classList.remove('hidden');
+            document.getElementById('step1Card').classList.remove('hidden');
+        }
+        // 兜底：无论初始化成败，3 秒内一定显示主界面，避免 PWA 启动画面后黑屏卡死
+        setTimeout(bootReady, 3000);
+
         // ==================== 数据库 ====================
-        const DB_NAME = 'HaikeInspectionDB_V4';
-        let db;
-        async function openDB() {
-            return new Promise((resolve, reject) => {
-                const req = indexedDB.open(DB_NAME, 1);
-                req.onupgradeneeded = e => { if (!e.target.result.objectStoreNames.contains('records')) e.target.result.createObjectStore('records', { keyPath: 'id' }); };
-                req.onsuccess = e => { db = e.target.result; resolve(); };
-                req.onerror = e => reject(e);
+        var DB_NAME = 'HaikeInspectionDB_V4';
+        var db;
+        function openDB() {
+            return new Promise(function (resolve) {
+                try {
+                    var req = indexedDB.open(DB_NAME, 1);
+                    req.onupgradeneeded = function (e) { if (!e.target.result.objectStoreNames.contains('records')) e.target.result.createObjectStore('records', { keyPath: 'id' }); };
+                    req.onsuccess = function (e) { db = e.target.result; resolve(); };
+                    req.onerror = function () { console.warn('IndexedDB 打开失败，将仅内存运行'); resolve(); };
+                    req.onblocked = function () { console.warn('IndexedDB blocked'); resolve(); };
+                } catch (e) { console.warn('IndexedDB 不支持'); resolve(); }
             });
         }
-        async function saveRecord(rec) {
-            const tx = db.transaction('records', 'readwrite');
-            tx.objectStore('records').put(rec);
-            return new Promise((resolve, reject) => { tx.oncomplete = resolve; tx.onerror = e => reject(e); });
+        function saveRecord(rec) {
+            return new Promise(function (resolve) {
+                try {
+                    if (!db) return resolve();
+                    var tx = db.transaction('records', 'readwrite');
+                    tx.objectStore('records').put(rec);
+                    tx.oncomplete = function () { resolve(); };
+                    tx.onerror = function () { resolve(); };
+                } catch (e) { resolve(); }
+            });
         }
 
         // ==================== 状态 ====================
-        let state = {
+        var state = {
             plate: '', inspector: '', paperGrade: '', packageType: '中包', totalPackages: '', location: '路口抽检站',
             photos: { front: null, left: null, right: null, afterLeft: null, afterRight: null },
             photoTimes: { front: '', left: '', right: '', afterLeft: '', afterRight: '' },
@@ -215,92 +237,86 @@
         };
 
         // ==================== 水印 ====================
-        function addWatermark(dataUrl, plate, location, inspector, maxWidth = 1200) {
-            return new Promise(resolve => {
-                const img = new Image();
-                img.onload = () => {
-                    const canvas = document.createElement('canvas');
-                    let w = img.width, h = img.height;
+        function addWatermark(dataUrl, plate, location, inspector, maxWidth) {
+            maxWidth = maxWidth || 1200;
+            return new Promise(function (resolve) {
+                var img = new Image();
+                img.onload = function () {
+                    var canvas = document.createElement('canvas');
+                    var w = img.width, h = img.height;
                     if (w > maxWidth) { h = Math.round(h * maxWidth / w); w = maxWidth; }
                     canvas.width = w; canvas.height = h;
-                    const ctx = canvas.getContext('2d');
+                    var ctx = canvas.getContext('2d');
                     ctx.drawImage(img, 0, 0, w, h);
-                    const now = new Date().toLocaleString('zh-CN', { hour12: false });
-                    const txt = `${plate} · ${location} · 抽检人:${inspector} · ${now}`;
-                    const fs = Math.max(14, Math.round(w / 32));
-                    ctx.font = `bold ${fs}px "PingFang SC","Microsoft YaHei",sans-serif`;
-                    const tw = ctx.measureText(txt).width, pad = 10;
+                    var now = new Date().toLocaleString('zh-CN', { hour12: false });
+                    var txt = plate + ' · ' + location + ' · 抽检人:' + inspector + ' · ' + now;
+                    var fs = Math.max(14, Math.round(w / 32));
+                    ctx.font = 'bold ' + fs + 'px "PingFang SC","Microsoft YaHei",sans-serif';
+                    var tw = ctx.measureText(txt).width, pad = 10;
                     ctx.fillStyle = 'rgba(255,255,255,0.75)';
-                    ctx.fillRect(w - tw - pad*2, h - fs - pad*2, tw + pad*2, fs + pad);
+                    ctx.fillRect(w - tw - pad * 2, h - fs - pad * 2, tw + pad * 2, fs + pad);
                     ctx.fillStyle = 'rgba(0,0,0,0.85)';
                     ctx.fillText(txt, w - tw - pad, h - pad);
                     resolve(canvas.toDataURL('image/jpeg', 0.85));
                 };
+                img.onerror = function () { resolve(dataUrl); };
                 img.src = dataUrl;
             });
         }
 
         // ==================== 工具函数 ====================
-        function getLocation() { return document.querySelector('#locationGroup .radio-btn.active')?.dataset.loc || '路口抽检站'; }
+        function getLocation() { return (document.querySelector('#locationGroup .radio-btn.active') || {}).dataset && (document.querySelector('#locationGroup .radio-btn.active').dataset.loc) || '路口抽检站'; }
         function getPlate() { return document.getElementById('plateInput').value.trim(); }
         function getInspector() { return document.getElementById('inspectorInput').value.trim(); }
 
         function checkStep1Ready() {
-            const plate = getPlate(), inspector = getInspector();
-            const paperGrade = document.getElementById('paperGradeInput').value.trim();
-            const totalPackages = document.getElementById('totalPackagesInput').value;
-            const allPhotos = state.photos.front && state.photos.left && state.photos.right;
-            const ready = plate && inspector && paperGrade && totalPackages && allPhotos;
-            document.getElementById('btnToStep2').disabled = !ready;
+            var plate = getPlate(), inspector = getInspector();
+            var paperGrade = document.getElementById('paperGradeInput').value.trim();
+            var totalPackages = document.getElementById('totalPackagesInput').value;
+            var allPhotos = state.photos.front && state.photos.left && state.photos.right;
+            document.getElementById('btnToStep2').disabled = !(plate && inspector && paperGrade && totalPackages && allPhotos);
         }
-
-        function checkStep3Ready() {
-            const ready = state.photos.afterLeft && state.photos.afterRight;
-            document.getElementById('btnToStep4').disabled = !ready;
-        }
-
+        function checkStep3Ready() { document.getElementById('btnToStep4').disabled = !(state.photos.afterLeft && state.photos.afterRight); }
         function checkStep5Ready() {
-            const water = document.getElementById('waterRateInput').value.trim();
-            const impurity = document.getElementById('impurityRateInput').value.trim();
-            const finalGrade = document.getElementById('finalGradeInput').value;
+            var water = document.getElementById('waterRateInput').value.trim();
+            var impurity = document.getElementById('impurityRateInput').value.trim();
+            var finalGrade = document.getElementById('finalGradeInput').value;
             document.getElementById('btnToStep6').disabled = !(water && impurity && finalGrade);
         }
 
         // 监听输入
-        document.addEventListener('DOMContentLoaded', () => {
+        document.addEventListener('DOMContentLoaded', function () {
             document.getElementById('plateInput').addEventListener('input', checkStep1Ready);
             document.getElementById('inspectorInput').addEventListener('input', checkStep1Ready);
             document.getElementById('paperGradeInput').addEventListener('input', checkStep1Ready);
             document.getElementById('totalPackagesInput').addEventListener('input', checkStep1Ready);
-            document.getElementById('packageTypeSelect').addEventListener('change', function() {
-                state.packageType = this.value;
-            });
+            document.getElementById('packageTypeSelect').addEventListener('change', function () { state.packageType = this.value; });
 
-            // 地点选择
-            document.getElementById('locationGroup').addEventListener('click', e => {
-                const btn = e.target.closest('.radio-btn'); if (!btn) return;
-                document.querySelectorAll('#locationGroup .radio-btn').forEach(b => b.classList.remove('active'));
+            document.getElementById('locationGroup').addEventListener('click', function (e) {
+                var btn = e.target.closest('.radio-btn'); if (!btn) return;
+                document.querySelectorAll('#locationGroup .radio-btn').forEach(function (b) { b.classList.remove('active'); });
                 btn.classList.add('active');
             });
-
-            // 品级选择
-            document.getElementById('finalGradeGroup').addEventListener('click', e => {
-                const btn = e.target.closest('.radio-btn'); if (!btn) return;
-                document.querySelectorAll('#finalGradeGroup .radio-btn').forEach(b => b.classList.remove('active'));
+            document.getElementById('finalGradeGroup').addEventListener('click', function (e) {
+                var btn = e.target.closest('.radio-btn'); if (!btn) return;
+                document.querySelectorAll('#finalGradeGroup .radio-btn').forEach(function (b) { b.classList.remove('active'); });
                 btn.classList.add('active');
                 document.getElementById('finalGradeInput').value = btn.dataset.grade;
                 checkStep5Ready();
             });
+
+            // 主界面就绪（DOM 已解析）
+            bootReady();
         });
 
         // ==================== 拍照处理 ====================
         function handlePhoto(type, input) {
             if (!input.files || !input.files[0]) return;
-            const plate = getPlate(), inspector = getInspector(), loc = getLocation();
+            var plate = getPlate(), inspector = getInspector(), loc = getLocation();
             if (!plate || !inspector) { showToast('请填写车牌号和抽检人'); input.value = ''; return; }
-            const reader = new FileReader();
-            reader.onload = async e => {
-                const wm = await addWatermark(e.target.result, plate, loc, inspector);
+            var reader = new FileReader();
+            reader.onload = async function (e) {
+                var wm = await addWatermark(e.target.result, plate, loc, inspector);
                 state.photos[type] = wm;
                 state.photoTimes[type] = new Date().toISOString();
                 updatePhotoPreview(type, wm);
@@ -309,42 +325,39 @@
             };
             reader.readAsDataURL(input.files[0]);
         }
-
         function updatePhotoPreview(type, dataUrl) {
-            const map = {
-                front: ['previewFront','photoAreaFront','wmFront'],
-                left: ['previewLeft','photoAreaLeft','wmLeft'],
-                right: ['previewRight','photoAreaRight','wmRight'],
-                afterLeft: ['previewAfterLeft','photoAreaAfterLeft','wmAfterLeft'],
+            var map = {
+                front: ['previewFront','photoAreaFront','wmFront'], left: ['previewLeft','photoAreaLeft','wmLeft'],
+                right: ['previewRight','photoAreaRight','wmRight'], afterLeft: ['previewAfterLeft','photoAreaAfterLeft','wmAfterLeft'],
                 afterRight: ['previewAfterRight','photoAreaAfterRight','wmAfterRight']
             };
-            const [previewId, areaId, wmId] = map[type];
-            const preview = document.getElementById(previewId), area = document.getElementById(areaId), wm = document.getElementById(wmId);
-            preview.src = dataUrl; preview.style.display = 'block';
-            area.classList.add('has-photo'); area.querySelector('.placeholder').style.display = 'none';
-            wm.style.display = 'block'; wm.textContent = new Date().toLocaleString('zh-CN');
+            var ids = map[type]; if (!ids) return;
+            var preview = document.getElementById(ids[0]), area = document.getElementById(ids[1]), wm = document.getElementById(ids[2]);
+            if (preview) { preview.src = dataUrl; preview.style.display = 'block'; }
+            if (area) { area.classList.add('has-photo'); var ph = area.querySelector('.placeholder'); if (ph) ph.style.display = 'none'; }
+            if (wm) { wm.style.display = 'block'; wm.textContent = new Date().toLocaleString('zh-CN'); }
         }
 
         // ==================== 抽样纸拍照 ====================
         function takeSamplePhoto() { document.getElementById('samplePhotoInput').value = ''; document.getElementById('samplePhotoInput').click(); }
         function handleSamplePhoto(input) {
             if (!input.files || !input.files[0]) return;
-            const plate = getPlate(), inspector = getInspector(), loc = getLocation();
+            var plate = getPlate(), inspector = getInspector(), loc = getLocation();
             if (!plate || !inspector) { showToast('请先填写信息'); return; }
-            const reader = new FileReader();
-            reader.onload = async e => {
-                const wm = await addWatermark(e.target.result, plate, loc, inspector);
-                const time = new Date().toISOString();
-                state.samplePhotos.push({ dataUrl: wm, time });
+            var reader = new FileReader();
+            reader.onload = async function (e) {
+                var wm = await addWatermark(e.target.result, plate, loc, inspector);
+                state.samplePhotos.push({ dataUrl: wm, time: new Date().toISOString() });
                 renderSamplePhotos();
                 document.getElementById('btnToStep5').disabled = state.samplePhotos.length === 0;
             };
             reader.readAsDataURL(input.files[0]);
         }
         function renderSamplePhotos() {
-            const container = document.getElementById('samplePhotosContainer');
-            container.innerHTML = state.samplePhotos.map((p, i) => `
-                <div class="sample-thumb"><img src="${p.dataUrl}"><div class="del-btn" onclick="deleteSamplePhoto(${i})">×</div></div>`).join('');
+            var container = document.getElementById('samplePhotosContainer');
+            container.innerHTML = state.samplePhotos.map(function (p, i) {
+                return '<div class="sample-thumb"><img src="' + p.dataUrl + '"><div class="del-btn" onclick="deleteSamplePhoto(' + i + ')">×</div></div>';
+            }).join('');
         }
         function deleteSamplePhoto(index) {
             state.samplePhotos.splice(index, 1);
@@ -354,31 +367,32 @@
 
         // ==================== 随机点位 ====================
         function generateTwoPoints() {
-            const array = new Uint32Array(4); crypto.getRandomValues(array);
-            const pts = []; const used = new Set();
-            for (let i = 0; i < 2; i++) {
-                let side, num, key;
+            var array = new Uint32Array(4);
+            try { crypto.getRandomValues(array); } catch (e) { for (var i = 0; i < 4; i++) array[i] = Math.floor(Math.random() * 1e9); }
+            var pts = [], used = {};
+            for (var i = 0; i < 2; i++) {
+                var side, num, key;
                 do {
-                    side = array[i * 2] % 2 === 0 ? '左' : '右';
+                    side = (array[i * 2] % 2 === 0) ? '左' : '右';
                     num = (array[i * 2 + 1] % 6) + 1;
-                    key = `${side}-${num}`;
-                } while (used.has(key));
-                used.add(key);
-                pts.push({ side, number: num, label: `${side}侧第${num}件` });
+                    key = side + '-' + num;
+                } while (used[key]);
+                used[key] = true;
+                pts.push({ side: side, number: num, label: side + '侧第' + num + '件' });
             }
             return pts;
         }
 
         // ==================== 步骤导航 ====================
         function updateStepDots(active) {
-            for (let i = 1; i <= 6; i++) {
-                const dot = document.getElementById('dot' + i);
+            for (var i = 1; i <= 6; i++) {
+                var dot = document.getElementById('dot' + i);
                 dot.classList.remove('active', 'done');
                 if (i < active) dot.classList.add('done');
                 if (i === active) dot.classList.add('active');
             }
         }
-        function hideAllCards() { for (let i = 1; i <= 6; i++) document.getElementById('step' + i + 'Card').classList.add('hidden'); }
+        function hideAllCards() { for (var i = 1; i <= 6; i++) document.getElementById('step' + i + 'Card').classList.add('hidden'); }
 
         function goStep2() {
             state.plate = getPlate().toUpperCase(); state.inspector = getInspector();
@@ -387,7 +401,7 @@
             state.totalPackages = document.getElementById('totalPackagesInput').value;
             state.location = getLocation();
             state.points = generateTwoPoints(); state.pointTime = new Date().toISOString(); state.rerandomUsed = false;
-            document.getElementById('pointsDisplay').innerHTML = state.points.map(p => `<span class="point-badge">📍 ${p.label}</span>`).join(' ');
+            document.getElementById('pointsDisplay').innerHTML = state.points.map(function (p) { return '<span class="point-badge">📍 ' + p.label + '</span>'; }).join(' ');
             document.getElementById('pointTime').textContent = new Date(state.pointTime).toLocaleString('zh-CN');
             hideAllCards(); document.getElementById('step2Card').classList.remove('hidden');
             updateStepDots(2); document.getElementById('btnRerandom').disabled = false;
@@ -395,7 +409,7 @@
         function rerandomPoints() {
             if (state.rerandomUsed) return;
             state.points = generateTwoPoints(); state.pointTime = new Date().toISOString(); state.rerandomUsed = true;
-            document.getElementById('pointsDisplay').innerHTML = state.points.map(p => `<span class="point-badge">📍 ${p.label}</span>`).join(' ');
+            document.getElementById('pointsDisplay').innerHTML = state.points.map(function (p) { return '<span class="point-badge">📍 ' + p.label + '</span>'; }).join(' ');
             document.getElementById('pointTime').textContent = new Date(state.pointTime).toLocaleString('zh-CN');
             document.getElementById('btnRerandom').disabled = true; showToast('已重新随机');
         }
@@ -409,7 +423,7 @@
             state.finalGrade = document.getElementById('finalGradeInput').value;
             if (!state.waterRate || !state.impurityRate || !state.finalGrade) return showToast('请完整填写扣罚和品级');
             state.recordId = 'HK' + Date.now().toString(36).toUpperCase();
-            const record = {
+            var record = {
                 id: state.recordId, plate: state.plate, inspector: state.inspector,
                 paperGrade: state.paperGrade, packageType: state.packageType, totalPackages: state.totalPackages,
                 location: state.location, photos: state.photos, photoTimes: state.photoTimes,
@@ -417,47 +431,61 @@
                 waterRate: state.waterRate, impurityRate: state.impurityRate, finalGrade: state.finalGrade,
                 createdAt: new Date().toISOString()
             };
-            try { await saveRecord(record); showToast('证据已存档'); } catch (e) { console.error(e); }
+            await saveRecord(record); showToast('证据已存档');
             renderSummary();
             hideAllCards(); document.getElementById('step6Card').classList.remove('hidden'); updateStepDots(6);
         }
 
         // ==================== 长图渲染 ====================
         function renderSummary() {
-            const { plate, inspector, paperGrade, packageType, totalPackages, location, points, pointTime, photos, photoTimes, samplePhotos, waterRate, impurityRate, finalGrade } = state;
-            const fmt = t => t ? new Date(t).toLocaleString('zh-CN') : '—';
-            let html = `
-                <div style="text-align:center; font-weight:800; font-size:1.1rem; margin-bottom:12px;">📸 海科废纸随机抽检证据长图</div>
-                <div class="info-block">
-                    <strong>车牌：</strong>${plate} &nbsp; <strong>抽检人：</strong>${inspector} &nbsp; <strong>地点：</strong>${location}<br>
-                    <strong>纸类品级：</strong>${paperGrade} &nbsp; <strong>包种类：</strong>${packageType} &nbsp; <strong>总计包数：</strong>${totalPackages}包<br>
-                    <strong>抽检点位：</strong>${points.map(p=>p.label).join('、')} &nbsp; <strong>生成时间：</strong>${fmt(pointTime)}<br>
-                    <strong>扣水比例：</strong>${waterRate}% &nbsp; <strong>扣杂质比例：</strong>${impurityRate}%<br>
-                    <strong>最终确认品级：</strong><span style="background:#f0f4f8;padding:2px 10px;border-radius:6px;font-weight:700;">${finalGrade}级</span>
-                </div>
-                <div class="photo-block"><img src="${photos.front}"><div class="caption">🚗 车牌正面 · ${fmt(photoTimes.front)}</div></div>
-                <div class="photo-block"><img src="${photos.left}"><div class="caption">⬅️ 整车左侧（进场） · ${fmt(photoTimes.left)}</div></div>
-                <div class="photo-block"><img src="${photos.right}"><div class="caption">➡️ 整车右侧（进场） · ${fmt(photoTimes.right)}</div></div>
-                <div class="photo-block"><img src="${photos.afterLeft}"><div class="caption">🔍 抽检后左侧 · ${fmt(photoTimes.afterLeft)}</div></div>
-                <div class="photo-block"><img src="${photos.afterRight}"><div class="caption">🔍 抽检后右侧 · ${fmt(photoTimes.afterRight)}</div></div>`;
-            samplePhotos.forEach((p, i) => {
-                html += `<div class="photo-block"><img src="${p.dataUrl}"><div class="caption">📦 抽样纸 #${i+1} · ${fmt(p.time)}</div></div>`;
+            var s = state;
+            var fmt = function (t) { return t ? new Date(t).toLocaleString('zh-CN') : '—'; };
+            var html = '<div style="text-align:center; font-weight:800; font-size:1.1rem; margin-bottom:12px;">📸 海科废纸随机抽检证据长图</div>'
+                + '<div class="info-block"><strong>车牌：</strong>' + s.plate + ' &nbsp; <strong>抽检人：</strong>' + s.inspector + ' &nbsp; <strong>地点：</strong>' + s.location + '<br>'
+                + '<strong>纸类品级：</strong>' + s.paperGrade + ' &nbsp; <strong>包种类：</strong>' + s.packageType + ' &nbsp; <strong>总计包数：</strong>' + s.totalPackages + '包<br>'
+                + '<strong>抽检点位：</strong>' + s.points.map(function (p) { return p.label; }).join('、') + ' &nbsp; <strong>生成时间：</strong>' + fmt(s.pointTime) + '<br>'
+                + '<strong>扣水比例：</strong>' + s.waterRate + '% &nbsp; <strong>扣杂质比例：</strong>' + s.impurityRate + '%<br>'
+                + '<strong>最终确认品级：</strong><span style="background:#f0f4f8;padding:2px 10px;border-radius:6px;font-weight:700;">' + s.finalGrade + '级</span></div>'
+                + '<div class="photo-block"><img src="' + s.photos.front + '"><div class="caption">🚗 车牌正面 · ' + fmt(s.photoTimes.front) + '</div></div>'
+                + '<div class="photo-block"><img src="' + s.photos.left + '"><div class="caption">⬅️ 整车左侧（进场） · ' + fmt(s.photoTimes.left) + '</div></div>'
+                + '<div class="photo-block"><img src="' + s.photos.right + '"><div class="caption">➡️ 整车右侧（进场） · ' + fmt(s.photoTimes.right) + '</div></div>'
+                + '<div class="photo-block"><img src="' + s.photos.afterLeft + '"><div class="caption">🔍 抽检后左侧 · ' + fmt(s.photoTimes.afterLeft) + '</div></div>'
+                + '<div class="photo-block"><img src="' + s.photos.afterRight + '"><div class="caption">🔍 抽检后右侧 · ' + fmt(s.photoTimes.afterRight) + '</div></div>';
+            s.samplePhotos.forEach(function (p, i) {
+                html += '<div class="photo-block"><img src="' + p.dataUrl + '"><div class="caption">📦 抽样纸 #' + (i + 1) + ' · ' + fmt(p.time) + '</div></div>';
             });
-            html += `<div class="info-block" style="background:#e8f8f0;border-left:4px solid #27ae60;">✅ 证据链完整：两组点位，全流程照片与品级记录，防偷换可追溯。</div>`;
+            html += '<div class="info-block" style="background:#e8f8f0;border-left:4px solid #27ae60;">✅ 证据链完整：两组点位，全流程照片与品级记录，防偷换可追溯。</div>';
             document.getElementById('summaryContent').innerHTML = html;
         }
 
+        // ==================== html2canvas：非阻塞动态加载 ====================
+        var h2cPromise = null;
+        function loadHtml2canvas() {
+            if (window.html2canvas) return Promise.resolve(window.html2canvas);
+            if (h2cPromise) return h2cPromise;
+            h2cPromise = new Promise(function (resolve, reject) {
+                var s = document.createElement('script');
+                // 使用 jsDelivr 稳定 CDN；如需完全离线，把 html2canvas.min.js 放进仓库并改为 ./html2canvas.min.js
+                s.src = 'https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js';
+                s.async = true;
+                s.onload = function () { window.html2canvas ? resolve(window.html2canvas) : reject(new Error('html2canvas 未导出')); };
+                s.onerror = function () { reject(new Error('html2canvas CDN 加载失败')); };
+                document.head.appendChild(s);
+            });
+            return h2cPromise;
+        }
+
         async function downloadLongImage() {
-            const el = document.getElementById('screenshotArea');
             showToast('生成超清长图中...');
             try {
-                const canvas = await html2canvas(el, { backgroundColor: '#ffffff', scale: 2.5, logging: false });
-                const link = document.createElement('a');
-                link.download = `抽检证据_${state.plate}_${Date.now()}.png`;
+                var html2canvas = await loadHtml2canvas();
+                var canvas = await html2canvas(document.getElementById('screenshotArea'), { backgroundColor: '#ffffff', scale: 2.5, logging: false });
+                var link = document.createElement('a');
+                link.download = '抽检证据_' + state.plate + '_' + Date.now() + '.png';
                 link.href = canvas.toDataURL('image/png');
                 link.click();
                 showToast('超清长图已下载 ✅');
-            } catch (e) { showToast('生成失败'); }
+            } catch (e) { showToast('长图生成失败：' + (e && e.message ? e.message : '请检查网络')); }
         }
 
         function resetForm() {
@@ -466,16 +494,16 @@
                 photos:{}, photoTimes:{}, points:[], pointTime:'', rerandomUsed:false,
                 samplePhotos:[], waterRate:'', impurityRate:'', finalGrade:''
             };
-            ['plateInput','inspectorInput','paperGradeInput','totalPackagesInput','waterRateInput','impurityRateInput'].forEach(id => document.getElementById(id).value = '');
+            ['plateInput','inspectorInput','paperGradeInput','totalPackagesInput','waterRateInput','impurityRateInput'].forEach(function (id) { document.getElementById(id).value = ''; });
             document.getElementById('packageTypeSelect').value = '中包';
             document.getElementById('finalGradeInput').value = '';
-            document.querySelectorAll('#locationGroup .radio-btn').forEach(b => b.classList.remove('active'));
+            document.querySelectorAll('#locationGroup .radio-btn').forEach(function (b) { b.classList.remove('active'); });
             document.querySelector('#locationGroup [data-loc="路口抽检站"]').classList.add('active');
-            document.querySelectorAll('#finalGradeGroup .radio-btn').forEach(b => b.classList.remove('active'));
-            ['Front','Left','Right','AfterLeft','AfterRight'].forEach(t => {
-                const prev = document.getElementById('preview'+t); if(prev) prev.style.display='none';
-                const area = document.getElementById('photoArea'+t); if(area) { area.classList.remove('has-photo'); area.querySelector('.placeholder').style.display=''; }
-                const wm = document.getElementById('wm'+t); if(wm) wm.style.display='none';
+            document.querySelectorAll('#finalGradeGroup .radio-btn').forEach(function (b) { b.classList.remove('active'); });
+            ['Front','Left','Right','AfterLeft','AfterRight'].forEach(function (t) {
+                var prev = document.getElementById('preview' + t); if (prev) prev.style.display = 'none';
+                var area = document.getElementById('photoArea' + t); if (area) { area.classList.remove('has-photo'); var ph = area.querySelector('.placeholder'); if (ph) ph.style.display = ''; }
+                var wm = document.getElementById('wm' + t); if (wm) wm.style.display = 'none';
             });
             document.getElementById('samplePhotosContainer').innerHTML = '';
             document.getElementById('btnToStep2').disabled = true;
@@ -483,21 +511,24 @@
             document.getElementById('btnToStep5').disabled = true;
             document.getElementById('btnToStep6').disabled = true;
             hideAllCards(); document.getElementById('step1Card').classList.remove('hidden');
-            updateStepDots(1);
-            checkStep1Ready();
+            updateStepDots(1); checkStep1Ready();
         }
 
-        function showToast(msg) { const t = document.getElementById('toast'); t.textContent = msg; t.style.display='block'; clearTimeout(t._t); t._t = setTimeout(()=>t.style.display='none', 2000); }
+        function showToast(msg) { var t = document.getElementById('toast'); t.textContent = msg; t.style.display = 'block'; clearTimeout(t._t); t._t = setTimeout(function () { t.style.display = 'none'; }, 2200); }
 
-        // ==================== 初始化数据库 ====================
-        (async () => { try { await openDB(); } catch(e) { console.warn('DB init failed'); } })();
+        // ==================== 初始化 ====================
+        (async function init() {
+            await openDB();
+            // 预加载长图库（不阻塞首屏，失败也不影响主流程）
+            loadHtml2canvas().catch(function (e) { console.warn(e.message || e); });
+        })();
 
-        // ==================== Service Worker 注册 ====================
+        // ==================== Service Worker 注册（稳健版） ====================
         if ('serviceWorker' in navigator) {
-            window.addEventListener('load', () => {
-                navigator.serviceWorker.register('./service-worker.js')
-                    .then(reg => console.log('✅ Service Worker 注册成功'))
-                    .catch(err => console.log('Service Worker 注册失败:', err));
+            window.addEventListener('load', function () {
+                navigator.serviceWorker.register('./service-worker.js', { scope: './' })
+                    .then(function (reg) { console.log('✅ Service Worker 注册成功', reg); })
+                    .catch(function (err) { console.warn('Service Worker 注册失败（不影响使用）:', err); });
             });
         }
     </script>
